@@ -41,6 +41,31 @@ compiles Visa CE3.0 evidence packets for disputes.
 └──────────────────────────────┘  └──────────────────────────────┘  └──────────────────────────────┘
 ```
 
+## Quick start for judges (PayPal AI Hackathon)
+
+Python 3.10+ (3.12 tested). No credentials are needed to try the whole money loop: without PayPal keys the gateway
+runs an offline mock with the same state machine as the sandbox.
+
+```bash
+pip install -r requirements.txt
+python scripts/01_generate_data.py          # ~90 s, builds the replay world (the trained models are committed)
+python scripts/serve.py --port 8080         # console at http://127.0.0.1:8080
+python scripts/16_paypal_demo.py            # decision -> PayPal order -> approve -> capture -> delivery -> refund
+python scripts/16_paypal_demo.py --rto      # same, but the parcel returns: the deposit is retained
+```
+
+To run against the **real PayPal sandbox**: create a Sandbox app and a **US** Business + Personal sandbox account at
+developer.paypal.com (India sandbox accounts cannot take USD or INR), copy `.env.example` to `.env`, fill in
+`PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET`, restart, and confirm `GET /v1/paypal/status` says `"mode": "sandbox"`.
+The demo script then prints the PayPal approval link; approve with the sandbox **Personal** account and press Enter.
+Docker works too: `docker compose up --build` (credentials are passed through from `.env`).
+
+What PayPal and AI each do here: ChakraShield's ML stack (LightGBM scorer, isotonic calibration, conformal
+prediction, graph-based ring detection) decides what to do with each order; the PayPal Orders, Payments (refund),
+Webhooks and Disputes APIs move the money and answer chargebacks. **What was added for this hackathon** (the project
+existed before, as a COD risk gateway): the whole `src/chakrashield/paypal/` package, the payment and dispute routes,
+the offline mock, `scripts/16_paypal_demo.py`, and `tests/test_paypal.py`.
+
 ## What we built — and what each piece measures
 
 All numbers reproduce with `.\run.ps1` (seed 42) plus the experiment scripts listed under *Run it*. World:
