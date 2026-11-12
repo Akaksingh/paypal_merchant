@@ -9,8 +9,6 @@
     "legit": 0.16151453599085946,
     "ring": 0.8987341772151899
   },
-  "shared_addresses": 40,
-  "shared_residents": 581,
   "graph": {
     "nodes": 91166,
     "components": 38092,
@@ -155,6 +153,9 @@
     }
   ],
   "clock_ts": 1736144666.8700206,
+  "source": "synthetic",
   "days": 400,
-  "seed": 42
+  "seed": 42,
+  "shared_addresses": 40,
+  "shared_residents": 581
 }

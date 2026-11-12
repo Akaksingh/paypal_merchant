@@ -20,9 +20,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from ..config import (BEHAVIOUR_PATH, CONFORMAL_ALPHA, DATA_DIR, ECONOMICS, EXPLORATION_EPSILON, LATENCY_BUDGET_MS,
                       LEDGER_PATH, MODEL_DIR, REPORT_DIR)
@@ -35,6 +37,7 @@ from ..learning.exploration import control_draw, propensity
 from ..learning.ledger import DecisionLedger
 from ..learning.response import BehaviourLearner, segment_key
 from ..monitoring.drift import ConformalDriftMonitor, DriftBaseline
+from ..paypal import PaymentError, PaymentService
 from ..policy.economics import TransactionContext
 from ..policy.reason_codes import reason_codes
 from ..policy.resolver import ACTION_UX, ALLOW, PREPAID, STEP_UP, DynamicRiskResolver
@@ -75,6 +78,7 @@ class State:
     learner: BehaviourLearner | None = None             # per-segment buyer-response estimates
     merchants: MerchantRegistry = field(default_factory=MerchantRegistry.builtin)   # config/merchants.json at startup
     loop: asyncio.AbstractEventLoop | None = None       # the server loop; queue hand-offs from worker threads go through it
+    payments: PaymentService | None = None             # PayPal money loop (sandbox, or the offline mock without credentials)
 
 
 state = State()
@@ -113,6 +117,7 @@ async def lifespan(app: FastAPI):
     state.decisions = DecisionLedger(LEDGER_PATH)
     state.learner = BehaviourLearner(prior=ECONOMICS).load(BEHAVIOUR_PATH)
     state.merchants = MerchantRegistry.load()
+    state.payments = PaymentService.from_env(ledger=state.ledger, log_path=DATA_DIR / "payments.jsonl")
 
     state.loop = asyncio.get_running_loop()
     state.queue = asyncio.Queue(maxsize=10_000)
@@ -142,6 +147,7 @@ async def _graph_worker() -> None:
                              addr_h=job["hashes"]["addr"], pin=job["pin"], ts=job["ts"], gmv=job["gmv"])
                 state.graph.ingest(job["order_id"], {k: v for k, v in job["hashes"].items() if v}, gmv=job["gmv"])
                 state.outcomes[job["order_id"]] = {"hashes": job["hashes"], "pin": job["pin"],
+                                                   "gmv": job["gmv"],
                                                    **{k: job.get(k) for k in ("served_action", "policy_action", "p_loss", "segment", "addr_attr")}}
                 state.outcomes.move_to_end(job["order_id"])
                 while len(state.outcomes) > MAX_PENDING_OUTCOMES:
@@ -384,7 +390,13 @@ async def risk_outcome(order_id: str, rto: bool,
     if state.decisions is not None:
         state.decisions.log_outcome(order_id, rto, {"served_action": served, "policy_action": meta.get("policy_action"),
                                                     "segment": seg, "stepup_result": stepup_result, "prepaid_result": prepaid_result})
-    return {"order_id": order_id, "rto": rto, "shipped": shipped, "learned": learned, "segment": seg}
+    payment = None
+    if shipped and state.payments is not None and state.payments.get(order_id) is not None:
+        try:   # delivered -> refund the deposit; RTO -> retain it. A PayPal failure must not lose the learning above.
+            payment = await run_in_threadpool(state.payments.settle, order_id, bool(rto))
+        except PaymentError as exc:
+            payment = {"action": "error", "detail": exc.detail}
+    return {"order_id": order_id, "rto": rto, "shipped": shipped, "learned": learned, "segment": seg, "payment": payment}
 
 
 @app.get("/v1/merchants")
@@ -446,6 +458,128 @@ async def ce3_candidates(n: int = 8):
         out.append({"transaction_id": i, "amount_inr": t.amount, "date": pd.Timestamp(t.ts, unit="s").strftime("%Y-%m-%d"),
                     "prior_card_txns": len(state.ledger.by_card(t.card_token)) - 1})
     return out
+
+
+# --------------------------------------------------------------------------- PayPal money loop
+def _pay() -> PaymentService:
+    if state.payments is None:
+        raise HTTPException(503, "payments not initialised")
+    return state.payments
+
+
+def _pp(call, *a, **kw):
+    try:
+        return call(*a, **kw)
+    except PaymentError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+
+
+@app.get("/v1/paypal/status")
+async def paypal_status():
+    """Which PayPal backend is live (mock | sandbox | live), the charge currency and INR->USD rate in use, and counters."""
+    return _pay().status()
+
+
+@app.post("/v1/pay/{order_id}/start")
+def pay_start(order_id: str):
+    """Create the PayPal order for the decision already served for ``order_id``: the deposit for STEP_UP_DEPOSIT,
+    the basket value for FORCE_PREPAID. ALLOW_COD needs no payment (409). Idempotent. Returns the approval URL
+    the checkout sends the buyer to."""
+    meta = state.outcomes.get(order_id)
+    if meta is None:
+        raise HTTPException(404, "order not seen by the gateway (evaluate it with commit=true first)")
+    p = _pp(_pay().start, order_id, meta.get("served_action"), float(meta.get("gmv") or 0.0), ECONOMICS.stepup_deposit)
+    return {**p.as_dict(), "mode": _pay().mode}
+
+
+@app.get("/v1/pay/{order_id}")
+async def pay_get(order_id: str):
+    p = _pay().get(order_id)
+    if p is None:
+        raise HTTPException(404, "no payment for this order")
+    return p.as_dict()
+
+
+@app.post("/v1/pay/{order_id}/capture")
+def pay_capture(order_id: str):
+    """Capture after the buyer approved (the return redirect and the approval webhook call the same thing)."""
+    return _pp(_pay().capture, order_id).as_dict()
+
+
+@app.get("/v1/pay/{order_id}/return", response_class=HTMLResponse)
+def pay_return(order_id: str, token: str | None = None):
+    p = _pay().get(order_id)
+    if p is None or (token and token != p.paypal_order_id):
+        raise HTTPException(404, "unknown payment")
+    p = _pp(_pay().capture, order_id)
+    what = "shipping deposit" if p.kind == "DEPOSIT" else "payment"
+    return HTMLResponse(f"<!doctype html><meta charset=utf-8><title>Payment received</title>"
+                        f"<body style='font:16px system-ui;max-width:32rem;margin:4rem auto;padding:0 1rem'>"
+                        f"<h2>Thank you</h2><p>Your {what} of {p.currency} {p.amount} was received for order "
+                        f"<b>{order_id}</b>. We are packing your parcel.</p></body>")
+
+
+@app.get("/v1/pay/{order_id}/cancel", response_class=HTMLResponse)
+async def pay_cancel(order_id: str):
+    return HTMLResponse("<!doctype html><meta charset=utf-8><title>Payment cancelled</title>"
+                        "<body style='font:16px system-ui;max-width:32rem;margin:4rem auto'><h2>Payment cancelled</h2>"
+                        "<p>Your order was not placed. You can go back and choose another option.</p></body>")
+
+
+@app.get("/v1/paypal/mock/approve/{pp_order_id}")
+def paypal_mock_approve(pp_order_id: str):
+    """Mock mode only: stands in for the buyer approving in the PayPal window, then follows the return redirect."""
+    svc = _pay()
+    if svc.mode != "mock":
+        raise HTTPException(404, "mock approval exists only in mock mode")
+    oid = svc._by_pp_order.get(pp_order_id)
+    if oid is None:
+        raise HTTPException(404, "unknown PayPal order")
+    svc.client.approve(pp_order_id)
+    return RedirectResponse(f"/v1/pay/{oid}/return?token={pp_order_id}", status_code=303)
+
+
+@app.post("/v1/paypal/webhook")
+async def paypal_webhook(request: Request):
+    """PayPal event receiver. The signature is verified with PayPal's verify-webhook-signature before anything is
+    acted on, and events are de-duplicated by id."""
+    try:
+        event = await request.json()
+    except ValueError as exc:
+        raise HTTPException(400, "body is not JSON") from exc
+    try:
+        return await run_in_threadpool(_pay().handle_webhook, dict(request.headers), event)
+    except PaymentError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+
+
+@app.get("/v1/paypal/disputes")
+def paypal_disputes():
+    """Disputes PayPal reports for the merchant account, plus the ones announced by webhook."""
+    svc = _pay()
+    try:
+        items = svc.client.list_disputes()
+    except Exception as exc:   # PayPalError or a network error: the console must still render
+        return {"mode": svc.mode, "items": [], "error": str(exc), "seen_by_webhook": list(svc.disputes_seen.values())}
+    return {"mode": svc.mode, "items": items, "seen_by_webhook": list(svc.disputes_seen.values())}
+
+
+class EvidenceRequest(BaseModel):
+    transaction_id: str
+    dispute_date: str | None = None
+    only_if_eligible: bool = True
+
+
+@app.post("/v1/paypal/disputes/{dispute_id}/evidence")
+def paypal_dispute_evidence(dispute_id: str, req: EvidenceRequest):
+    """Compile the deterministic CE3.0 packet for ``transaction_id`` and submit it to PayPal for ``dispute_id``."""
+    if req.dispute_date is not None:
+        try:
+            datetime.strptime(req.dispute_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise HTTPException(422, f"dispute_date must be YYYY-MM-DD: {exc}") from exc
+    return _pp(_pay().submit_dispute_evidence, dispute_id, req.transaction_id, dispute_date=req.dispute_date,
+               only_if_eligible=req.only_if_eligible)
 
 
 @app.get("/v1/graph/rings")

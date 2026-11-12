@@ -1,6 +1,6 @@
 # ChakraShield
 
-[![ci](https://github.com/Akaksingh/razorpay_buildathon/actions/workflows/ci.yml/badge.svg)](https://github.com/Akaksingh/razorpay_buildathon/actions/workflows/ci.yml)
+[![ci](https://github.com/Akaksingh/paypal_merchant/actions/workflows/ci.yml/badge.svg)](https://github.com/Akaksingh/paypal_merchant/actions/workflows/ci.yml)
 
 **An in-line dynamic checkout intervenor and subgraph abuse sentinel for cash-on-delivery risk — built to
 survive a live payments environment, not just a demo.**
@@ -70,7 +70,40 @@ hostels / offices / PGs with 581 resident phones. Test split = the chronological
 | Printable CE3.0 evidence packet | `?format=html` and `GET /v1/dispute/packet/{id}.html` carry the same SHA-256 as the JSON packet; 28 of 50 sampled disputes compile eligible; render 0.05 ms; Mastercard difference documented |
 | GraphSAGE ring embeddings (experiment, not served) | matches the served union-find on test-era phones (AUC 0.9999, precision 0.991 at recall 1.000) where a logistic regression on the same node features reaches 0.747; stacked into the served model it *lowers* test AUC 0.799 → 0.790 — an end-of-era score is not a point-in-time feature |
 | Docker Compose + GitHub Actions CI | 1.0 GB image, healthy 12 s after start on an empty volume; CI regenerates the default world, trains, runs the suite, and builds and health-checks the container |
-| Test suite | **92 / 92** passing (`pytest tests`) |
+| Test suite | **111 passed, 1 skipped** (`pytest tests`; the skip is the GraphSAGE test, which needs `torch`, not installed here) |
+
+## PayPal integration — from decision to money
+
+ChakraShield decides; PayPal moves the money. The risk call stays free of network I/O (25 ms budget) and the
+checkout then makes a second call for the action it was served:
+
+| Decision | PayPal call | Settlement |
+|---|---|---|
+| `STEP_UP_DEPOSIT` | `POST /v2/checkout/orders` for the ₹49 deposit, charged in USD at `PAYPAL_INR_PER_USD` (₹49 ≈ $0.58; `PAYPAL_CURRENCY=INR` charges ₹49.00 but needs a sandbox merchant that accepts INR) | delivered → `POST /v2/payments/captures/{id}/refund`; RTO → deposit retained |
+| `FORCE_PREPAID` | `POST /v2/checkout/orders` for the basket value | left to the merchant |
+| `ALLOW_COD` | none (`409`) | — |
+
+```
+POST /v1/risk/evaluate?commit=true        → decision
+POST /v1/pay/{order_id}/start             → PayPal order + approve_url (buyer is redirected there)
+GET  /v1/pay/{order_id}/return            → capture after approval (CHECKOUT.ORDER.APPROVED webhook does the same)
+POST /v1/risk/outcome/{order_id}?rto=...  → learns, then refunds or retains the deposit
+POST /v1/paypal/webhook                   → verify-webhook-signature, de-duplicated by event id
+GET  /v1/paypal/disputes                  → PayPal disputes
+POST /v1/paypal/disputes/{id}/evidence    → compile the CE3.0 packet, submit via provide-evidence (multipart)
+```
+
+Every money call carries a `PayPal-Request-Id`, so a retry cannot charge or refund twice. With no credentials the
+gateway runs an offline mock with the same interface and state machine (capture is refused before approval;
+`GET /v1/paypal/mock/approve/{id}` stands in for the buyer). Set `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET`
+(see `.env.example`) to use the sandbox. `GET /v1/paypal/status` reports which backend is live.
+
+Status, stated plainly: the real client's request shapes (URL, headers, JSON and multipart bodies, token reuse) are
+unit-tested through an httpx mock transport, and the whole loop is tested end to end against the offline mock. It has
+**not** been run against the live PayPal sandbox yet, and
+the dispute `evidence_type` / file rules are written from PayPal's documented multipart format, unverified live.
+Note PayPal's fixed per-transaction fee is large relative to a ₹49 (≈ $0.58) deposit; that economics question
+belongs in the merchant's `stepup_deposit` setting.
 
 ### Classification accuracy, stated plainly
 
