@@ -37,8 +37,13 @@ def call(base: str, method: str, path: str, body: dict | None = None) -> tuple[i
             return e.code, {"detail": raw.decode("utf-8", "replace")[:200]}
 
 
+SLOW = False
+
+
 def step(n: int, title: str) -> None:
-    print(f"\n[{n}] {title}")
+    if SLOW:
+        time.sleep(2.0)
+    print(f"\n[{n}] {title}", flush=True)
 
 
 def main() -> int:
@@ -47,7 +52,12 @@ def main() -> int:
     ap.add_argument("--scenario", default="step-up", help="scenario tag from /v1/scenarios (step-up -> deposit, prepaid -> full basket)")
     ap.add_argument("--rto", action="store_true", help="simulate the parcel coming back (deposit is retained instead of refunded)")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--wait", type=int, default=0, metavar="SECONDS",
+                    help="sandbox: instead of pressing Enter, poll until the buyer has paid (up to SECONDS)")
+    ap.add_argument("--slow", action="store_true", help="pause between steps so a screen recording is readable")
     a = ap.parse_args()
+    global SLOW
+    SLOW = a.slow
     base = a.url.rstrip("/")
 
     st, status = call(base, "GET", "/v1/paypal/status")
@@ -91,7 +101,18 @@ def main() -> int:
         print("Approve here with a sandbox PERSONAL account:\n  " + p["approve_url"])
         if not a.no_browser:
             webbrowser.open(p["approve_url"])
-        input("Press Enter once PayPal shows 'Thank you'... ")
+        if a.wait:
+            print(f"Waiting up to {a.wait}s for the buyer to approve in the PayPal window...", flush=True)
+            deadline = time.time() + a.wait
+            while time.time() < deadline:
+                if call(base, "GET", f"/v1/pay/{oid}")[1].get("status") == "CAPTURED":   # the return redirect captures
+                    break
+                time.sleep(1.5)
+            else:
+                print("timed out waiting for approval")
+                return 1
+        else:
+            input("Press Enter once PayPal shows 'Thank you'... ")
 
     step(4, "Capture")
     st, c = call(base, "POST", f"/v1/pay/{oid}/capture")
